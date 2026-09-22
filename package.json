@@ -1,0 +1,12 @@
+{
+  "name": "aral-os",
+  "version": "1.0.0",
+  "description": "ARAL OS - AI Agent System",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
