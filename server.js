@@ -472,39 +472,48 @@ async function askAIWithSystem(systemPrompt, userText) {
 // ========================================
  
 async function sendTelegramMessage(chatId, text) {
- 
+
   const token = process.env.TELEGRAM_BOT_TOKEN;
- 
+
   if (!token) {
     throw new Error("TELEGRAM_BOT_TOKEN is missing");
   }
- 
-  const response = await fetch(
-    `https://api.telegram.org/bot${token}/sendMessage`,
-    {
-      method: "POST",
- 
-      headers: {
-        "Content-Type": "application/json"
-      },
- 
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text
-      })
-    }
-  );
- 
-  if (!response.ok) {
- 
-    const errorText = await response.text();
- 
-    console.error(
-      "TELEGRAM ERROR:",
-      errorText
+
+  const MAX_LENGTH = 4000; // чуть меньше лимита Telegram (4096) для запаса
+  const chunks = [];
+
+  for (let i = 0; i < text.length; i += MAX_LENGTH) {
+    chunks.push(text.slice(i, i + MAX_LENGTH));
+  }
+
+  for (const chunk of chunks) {
+    const response = await fetch(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: chunk
+        })
+      }
     );
- 
-    throw new Error(errorText);
+
+    if (!response.ok) {
+
+      const errorText = await response.text();
+
+      console.error(
+        "TELEGRAM ERROR:",
+        errorText
+      );
+
+      throw new Error(errorText);
+    }
   }
 }
  
