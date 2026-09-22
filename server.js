@@ -431,7 +431,7 @@ async function askAIWithSystem(systemPrompt, userText) {
       },
  
       body: JSON.stringify({
-        model: "openrouter/free",
+        model: "openai/gpt-oss-120b:free",
  
         messages: [
           {
