@@ -1,5 +1,11 @@
 const express = require("express");
-const { initMemory, saveMemory, getProjectContext } = require("./memory");
+const {
+  initMemory,
+  saveMemory,
+  getProjectContext,
+  saveConversationTurn,
+  getRecentConversation
+} = require("./memory");
  
 const app = express();
  
@@ -34,10 +40,20 @@ app.post("/telegram/webhook", async (req, res) => {
     const chatId = update.message.chat.id;
     const userText = update.message.text || "";
  
+    if (!userText) {
+      return res.sendStatus(200);
+    }
+ 
     console.log("USER:", userText);
  
+    // Сохраняем сообщение пользователя в историю диалога
+    await saveConversationTurn({ chatId, role: "user", content: userText });
+ 
     // Передаём задачу главному агенту
-    const result = await masterAgent(userText);
+    const result = await masterAgent(userText, chatId);
+ 
+    // Сохраняем ответ бота в историю диалога
+    await saveConversationTurn({ chatId, role: "assistant", content: result });
  
     await sendTelegramMessage(chatId, result);
  
@@ -62,7 +78,7 @@ app.post("/telegram/webhook", async (req, res) => {
 // MASTER AGENT
 // ========================================
  
-async function masterAgent(userText) {
+async function masterAgent(userText, chatId) {
  
   console.log("MASTER получил задачу:", userText);
  
@@ -72,7 +88,7 @@ async function masterAgent(userText) {
   console.log("MASTER выбрал:", agent);
  
   // Передаём задачу выбранному агенту
-  const result = await runAgent(agent, userText);
+  const result = await runAgent(agent, userText, chatId);
  
   return result;
 }
@@ -194,10 +210,64 @@ function memoryTypeFor(agent) {
  
  
 // ========================================
+// ВЕБ-ПОИСК (Tavily) — только для Research Agent
+// ========================================
+ 
+async function webSearch(query, maxResults = 5) {
+ 
+  const apiKey = process.env.TAVILY_API_KEY;
+ 
+  if (!apiKey) {
+    console.error("TAVILY_API_KEY is missing — пропускаем веб-поиск");
+    return null;
+  }
+ 
+  try {
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query: query,
+        max_results: maxResults,
+        search_depth: "basic"
+      })
+    });
+ 
+    const data = await response.json();
+ 
+    if (!response.ok) {
+      console.error("TAVILY ERROR:", data);
+      return null;
+    }
+ 
+    return data.results || [];
+ 
+  } catch (err) {
+    console.error("TAVILY REQUEST ERROR:", err);
+    return null;
+  }
+}
+ 
+function formatSearchResults(results) {
+ 
+  if (!results || results.length === 0) {
+    return "";
+  }
+ 
+  const formatted = results
+    .map((r, i) => `${i + 1}. ${r.title}\n${r.url}\n${r.content}`)
+    .join("\n\n");
+ 
+  return `WEB SEARCH RESULTS (реальные результаты поиска в интернете — используй их, ссылайся на источники по URL):\n\n${formatted}`;
+}
+ 
+ 
+// ========================================
 // ЗАПУСК СПЕЦИАЛИСТА
 // ========================================
  
-async function runAgent(agent, userText) {
+async function runAgent(agent, userText, chatId) {
  
   let systemPrompt = "";
  
@@ -264,12 +334,12 @@ async function runAgent(agent, userText) {
 3. Гипотезы
 4. Выводы
  
-Не выдумывай источники или факты.
+У тебя ЕСТЬ доступ к реальному веб-поиску.
+Если ниже есть блок WEB SEARCH RESULTS — опирайся на него,
+цитируй конкретные факты и указывай источник (URL) рядом с фактом.
  
-ВАЖНО:
-На текущем этапе у тебя ещё нет отдельного
-инструмента интернет-поиска. Поэтому не утверждай,
-что ты провёл реальный поиск в интернете, если его не было.
+Если блока WEB SEARCH RESULTS нет — честно скажи,
+что не смог выполнить поиск, и не выдумывай источники.
 `;
  
   }
@@ -358,22 +428,38 @@ CTA
  
   }
  
-  // === ПАМЯТЬ: читаем, что уже было сделано по проекту ===
+  // === ПАМЯТЬ ПРОЕКТА: что уже сделали агенты ===
   let projectContext = "";
  
   try {
     projectContext = await getProjectContext("default");
   } catch (memError) {
     console.error("MEMORY READ ERROR:", memError);
-    // Если память недоступна — работаем без неё, не роняем бота
   }
  
-  const finalSystemPrompt = projectContext
-    ? `${systemPrompt}\n\n${projectContext}`
-    : systemPrompt;
+  // === ПАМЯТЬ РАЗГОВОРА: недавний диалог с этим чатом ===
+  let conversationContext = "";
+ 
+  try {
+    conversationContext = await getRecentConversation(chatId);
+  } catch (convError) {
+    console.error("CONVERSATION READ ERROR:", convError);
+  }
+ 
+  // === ВЕБ-ПОИСК: только для Research Agent ===
+  let searchContext = "";
+ 
+  if (agent === "RESEARCH") {
+    const results = await webSearch(userText);
+    searchContext = formatSearchResults(results);
+  }
+ 
+  const contextBlocks = [systemPrompt, conversationContext, projectContext, searchContext]
+    .filter(Boolean)
+    .join("\n\n");
  
   const result = await askAIWithSystem(
-    finalSystemPrompt,
+    contextBlocks,
     userText
   );
  
@@ -387,7 +473,6 @@ CTA
     });
   } catch (memError) {
     console.error("MEMORY SAVE ERROR:", memError);
-    // Не мешаем ответу пользователю, даже если сохранение не удалось
   }
  
   return result;
@@ -472,46 +557,46 @@ async function askAIWithSystem(systemPrompt, userText) {
 // ========================================
  
 async function sendTelegramMessage(chatId, text) {
-
+ 
   const token = process.env.TELEGRAM_BOT_TOKEN;
-
+ 
   if (!token) {
     throw new Error("TELEGRAM_BOT_TOKEN is missing");
   }
-
+ 
   const MAX_LENGTH = 4000; // чуть меньше лимита Telegram (4096) для запаса
   const chunks = [];
-
+ 
   for (let i = 0; i < text.length; i += MAX_LENGTH) {
     chunks.push(text.slice(i, i + MAX_LENGTH));
   }
-
+ 
   for (const chunk of chunks) {
     const response = await fetch(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         method: "POST",
-
+ 
         headers: {
           "Content-Type": "application/json"
         },
-
+ 
         body: JSON.stringify({
           chat_id: chatId,
           text: chunk
         })
       }
     );
-
+ 
     if (!response.ok) {
-
+ 
       const errorText = await response.text();
-
+ 
       console.error(
         "TELEGRAM ERROR:",
         errorText
       );
-
+ 
       throw new Error(errorText);
     }
   }
@@ -529,7 +614,7 @@ app.listen(PORT, () => {
     `ARAL OS running on port ${PORT}`
   );
  
-  // Создаём таблицу памяти при старте (если её ещё нет)
+  // Создаём таблицы памяти при старте (если их ещё нет)
   initMemory().catch((err) => {
     console.error("MEMORY INIT ERROR:", err);
   });
